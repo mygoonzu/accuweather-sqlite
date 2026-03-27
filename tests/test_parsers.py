@@ -1,7 +1,25 @@
 import unittest
 from datetime import date
+from tempfile import TemporaryDirectory
+from pathlib import Path
+import argparse
+import sqlite3
 
-from weather_sync import LOCATIONS, SyncError, parse_daily_forecasts, parse_monthly_history, validate_accuweather_url
+from weather_sync import (
+    LOCATIONS,
+    ForecastRecord,
+    HistoryRecord,
+    SyncError,
+    ensure_schema,
+    handle_export_csv,
+    handle_status,
+    parse_daily_forecasts,
+    parse_monthly_history,
+    upsert_forecasts,
+    upsert_history,
+    upsert_locations,
+    validate_accuweather_url,
+)
 
 
 FORECAST_HTML = """
@@ -79,6 +97,60 @@ class ParserTests(unittest.TestCase):
     def test_validate_accuweather_url_rejects_untrusted_host(self) -> None:
         with self.assertRaises(SyncError):
             validate_accuweather_url("https://evil.example.com/path")
+
+    def test_status_and_export_csv_work_with_sample_db(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "weather.db"
+            output_path = Path(tmp_dir) / "forecast.csv"
+            with sqlite3.connect(db_path) as conn:
+                ensure_schema(conn)
+                upsert_locations(conn, LOCATIONS)
+                upsert_forecasts(
+                    conn,
+                    "2026-03-27T00:00:00+07:00",
+                    [
+                        ForecastRecord(
+                            location_key=LOCATIONS[0].key,
+                            weather_date=date(2026, 3, 27),
+                            high_c=30,
+                            low_c=24,
+                            precip_probability=55,
+                            phrase="Cloudy",
+                            detail_url=LOCATIONS[0].daily_url,
+                            source_url=LOCATIONS[0].daily_url,
+                        )
+                    ],
+                )
+                upsert_history(
+                    conn,
+                    "2026-03-27T00:00:00+07:00",
+                    [
+                        HistoryRecord(
+                            location_key=LOCATIONS[0].key,
+                            weather_date=date(2026, 3, 26),
+                            actual_high_c=29,
+                            actual_low_c=22,
+                            source_url=LOCATIONS[0].monthly_url(date(2026, 3, 1)),
+                        )
+                    ],
+                )
+                conn.commit()
+
+            status_args = argparse.Namespace(db=str(db_path))
+            export_args = argparse.Namespace(
+                db=str(db_path),
+                table="forecast_daily",
+                output=str(output_path),
+                city="Ha Noi",
+                date_from="2026-03-27",
+                date_to="2026-03-27",
+            )
+
+            self.assertEqual(handle_status(status_args), 0)
+            self.assertEqual(handle_export_csv(export_args), 0)
+            csv_text = output_path.read_text(encoding="utf-8")
+            self.assertIn("Ha Noi", csv_text)
+            self.assertIn("2026-03-27", csv_text)
 
 
 if __name__ == "__main__":

@@ -42,6 +42,19 @@ python3 weather_sync.py --db data/weather.db --lock-file /tmp/accuweather.lock s
 python3 weather_sync.py --db data/weather.db sync --min-request-interval 1.0
 ```
 
+Kiểm tra nhanh database:
+
+```bash
+python3 weather_sync.py --db data/weather.db status
+```
+
+Xuất CSV:
+
+```bash
+python3 weather_sync.py --db data/weather.db export-csv --table forecast_daily --output exports/forecast.csv
+python3 weather_sync.py --db data/weather.db export-csv --table history_daily --city "Ha Noi" --date-from 2026-03-20 --date-to 2026-03-27 --output exports/hanoi-history.csv
+```
+
 ## Schema SQLite
 
 Database tạo 3 bảng:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import fcntl
 import html
 import logging
@@ -101,6 +102,22 @@ def build_parser() -> argparse.ArgumentParser:
     list_parser = subparsers.add_parser("list-locations", help="Print built-in AccuWeather locations")
     list_parser.set_defaults(handler=handle_list_locations)
 
+    status_parser = subparsers.add_parser("status", help="Show a summary of the SQLite database contents")
+    status_parser.set_defaults(handler=handle_status)
+
+    export_parser = subparsers.add_parser("export-csv", help="Export forecast or history rows from SQLite to CSV")
+    export_parser.add_argument(
+        "--table",
+        required=True,
+        choices=("forecast_daily", "history_daily"),
+        help="Which logical table to export",
+    )
+    export_parser.add_argument("--output", required=True, help="CSV output path")
+    export_parser.add_argument("--city", help="Optional city filter, e.g. 'Ha Noi'")
+    export_parser.add_argument("--date-from", help="Inclusive date filter in YYYY-MM-DD format")
+    export_parser.add_argument("--date-to", help="Inclusive date filter in YYYY-MM-DD format")
+    export_parser.set_defaults(handler=handle_export_csv)
+
     sync_parser = subparsers.add_parser("sync", help="Fetch history and forecast, then upsert into SQLite")
     sync_parser.add_argument(
         "--history-backfill-days",
@@ -141,6 +158,13 @@ def month_start(any_date: date) -> date:
 
 def previous_month(any_date: date) -> date:
     return (any_date.replace(day=1) - timedelta(days=1)).replace(day=1)
+
+
+def parse_iso_date(value: str, flag_name: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise SystemExit(f"{flag_name} must be in YYYY-MM-DD format") from exc
 
 
 def parse_temperature(text: str) -> int | None:
@@ -496,6 +520,161 @@ def collect_months(start_date: date, end_date: date) -> list[date]:
 def handle_list_locations(args: argparse.Namespace) -> int:
     for location in LOCATIONS:
         print(f"{location.city}\t{location.key}\t{location.slug}\t{location.today_url}")
+    return 0
+
+
+def require_db_path(db_path: Path) -> None:
+    if not db_path.exists():
+        raise SystemExit(f"SQLite database not found: {db_path}")
+
+
+def open_db(db_path: Path) -> sqlite3.Connection:
+    require_db_path(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def handle_status(args: argparse.Namespace) -> int:
+    db_path = Path(args.db)
+    with open_db(db_path) as conn:
+        location_count = conn.execute("SELECT COUNT(*) AS count FROM locations").fetchone()["count"]
+        forecast_count = conn.execute("SELECT COUNT(*) AS count FROM forecast_daily").fetchone()["count"]
+        history_count = conn.execute("SELECT COUNT(*) AS count FROM history_daily").fetchone()["count"]
+        forecast_range = conn.execute(
+            "SELECT MIN(weather_date) AS min_date, MAX(weather_date) AS max_date, MAX(scraped_at) AS scraped_at FROM forecast_daily"
+        ).fetchone()
+        history_range = conn.execute(
+            "SELECT MIN(weather_date) AS min_date, MAX(weather_date) AS max_date, MAX(scraped_at) AS scraped_at FROM history_daily"
+        ).fetchone()
+        per_city = conn.execute(
+            """
+            SELECT
+                l.city,
+                COALESCE(f.forecast_count, 0) AS forecast_count,
+                COALESCE(h.history_count, 0) AS history_count
+            FROM locations l
+            LEFT JOIN (
+                SELECT location_key, COUNT(*) AS forecast_count
+                FROM forecast_daily
+                GROUP BY location_key
+            ) f ON f.location_key = l.location_key
+            LEFT JOIN (
+                SELECT location_key, COUNT(*) AS history_count
+                FROM history_daily
+                GROUP BY location_key
+            ) h ON h.location_key = l.location_key
+            ORDER BY l.city
+            """
+        ).fetchall()
+
+    print(f"Database: {db_path.resolve()}")
+    print(f"Locations: {location_count}")
+    print(
+        f"Forecast rows: {forecast_count} | range: {forecast_range['min_date']} -> {forecast_range['max_date']} "
+        f"| last scrape: {forecast_range['scraped_at']}"
+    )
+    print(
+        f"History rows: {history_count} | range: {history_range['min_date']} -> {history_range['max_date']} "
+        f"| last scrape: {history_range['scraped_at']}"
+    )
+    print("Per city:")
+    for row in per_city:
+        print(f"- {row['city']}: forecast={row['forecast_count']} history={row['history_count']}")
+    return 0
+
+
+def handle_export_csv(args: argparse.Namespace) -> int:
+    db_path = Path(args.db)
+    output_path = Path(args.output)
+    date_from = parse_iso_date(args.date_from, "--date-from") if args.date_from else None
+    date_to = parse_iso_date(args.date_to, "--date-to") if args.date_to else None
+    if date_from and date_to and date_from > date_to:
+        raise SystemExit("--date-from must be <= --date-to")
+
+    if args.table == "forecast_daily":
+        select_sql = """
+            SELECT
+                l.city,
+                l.admin_area,
+                l.country,
+                f.weather_date,
+                f.high_c,
+                f.low_c,
+                f.precip_probability,
+                f.phrase,
+                f.detail_url,
+                f.source_url,
+                f.scraped_at
+            FROM forecast_daily f
+            JOIN locations l ON l.location_key = f.location_key
+        """
+        fieldnames = [
+            "city",
+            "admin_area",
+            "country",
+            "weather_date",
+            "high_c",
+            "low_c",
+            "precip_probability",
+            "phrase",
+            "detail_url",
+            "source_url",
+            "scraped_at",
+        ]
+    else:
+        select_sql = """
+            SELECT
+                l.city,
+                l.admin_area,
+                l.country,
+                h.weather_date,
+                h.actual_high_c,
+                h.actual_low_c,
+                h.source_url,
+                h.scraped_at
+            FROM history_daily h
+            JOIN locations l ON l.location_key = h.location_key
+        """
+        fieldnames = [
+            "city",
+            "admin_area",
+            "country",
+            "weather_date",
+            "actual_high_c",
+            "actual_low_c",
+            "source_url",
+            "scraped_at",
+        ]
+
+    conditions: list[str] = []
+    params: list[str] = []
+    if args.city:
+        conditions.append("l.city = ?")
+        params.append(args.city)
+    if date_from:
+        conditions.append("weather_date >= ?")
+        params.append(date_from.isoformat())
+    if date_to:
+        conditions.append("weather_date <= ?")
+        params.append(date_to.isoformat())
+
+    query = select_sql
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY city, weather_date"
+
+    with open_db(db_path) as conn:
+        rows = conn.execute(query, params).fetchall()
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(dict(row))
+
+    print(f"Exported {len(rows)} rows from {args.table} to {output_path.resolve()}")
     return 0
 
 
