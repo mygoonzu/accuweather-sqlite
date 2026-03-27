@@ -24,14 +24,14 @@ pip install -r requirements.txt
 ## Chạy đồng bộ
 
 ```bash
-python3 weather_sync.py sync --db data/weather.db
+python3 weather_sync.py --db data/weather.db sync
 ```
 
 Tuỳ chọn hữu ích:
 
 ```bash
-python3 weather_sync.py sync --db data/weather.db --history-backfill-days 7 --forecast-days 30
-python3 weather_sync.py sync --db data/weather.db --dry-run --log-level DEBUG
+python3 weather_sync.py --db data/weather.db sync --history-backfill-days 7 --forecast-days 30
+python3 weather_sync.py --db data/weather.db --log-level DEBUG sync --dry-run
 python3 weather_sync.py list-locations
 ```
 
@@ -57,7 +57,7 @@ ORDER BY l.city, f.weather_date;
 Ví dụ chạy lúc `00:10` mỗi ngày theo timezone server:
 
 ```cron
-10 0 * * * cd /home/ruby/accuweather-sqlite && /usr/bin/python3 weather_sync.py sync --db /home/ruby/accuweather-sqlite/data/weather.db >> /home/ruby/accuweather-sqlite/sync.log 2>&1
+10 0 * * * cd /home/ruby/accuweather-sqlite && /usr/bin/python3 weather_sync.py --db /home/ruby/accuweather-sqlite/data/weather.db sync >> /home/ruby/accuweather-sqlite/sync.log 2>&1
 ```
 
 Nếu muốn ngày chạy bám theo giờ Việt Nam, giữ tham số mặc định `--timezone Asia/Ho_Chi_Minh`.
@@ -67,3 +67,4 @@ Nếu muốn ngày chạy bám theo giờ Việt Nam, giữ tham số mặc đ�
 - Tool này scrape HTML của AccuWeather, không dùng API chính thức.
 - Trang `monthly` hiện phù hợp để lấy lịch sử nhiệt độ ngày đã qua; forecast chi tiết lấy từ trang `daily`.
 - Nếu AccuWeather đổi cấu trúc HTML, parser có thể cần cập nhật.
+- Script chỉ chấp nhận response `https://www.accuweather.com` và giới hạn phạm vi sync để giảm rủi ro ghi dữ liệu bất thường hoặc kéo quá nhiều request.

@@ -11,15 +11,18 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
 
 
 BASE_URL = "https://www.accuweather.com"
+ALLOWED_HOST = "www.accuweather.com"
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36"
 DEFAULT_TIMEZONE = "Asia/Ho_Chi_Minh"
+MAX_FORECAST_DAYS = 30
+MAX_HISTORY_BACKFILL_DAYS = 366
 
 
 @dataclass(frozen=True)
@@ -70,6 +73,10 @@ class HistoryRecord:
     source_url: str
 
 
+class SyncError(RuntimeError):
+    pass
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Sync AccuWeather history and forecast data for Ha Noi, Ho Chi Minh City, and Da Nang into SQLite."
@@ -92,13 +99,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--history-backfill-days",
         type=int,
         default=7,
-        help="How many previous days of history to upsert on each run. Default: %(default)s",
+        help=f"How many previous days of history to upsert on each run. Max: {MAX_HISTORY_BACKFILL_DAYS}. Default: %(default)s",
     )
     sync_parser.add_argument(
         "--forecast-days",
         type=int,
         default=30,
-        help="How many upcoming daily forecasts to keep from the daily page. Default: %(default)s",
+        help=f"How many upcoming daily forecasts to keep from the daily page. Max: {MAX_FORECAST_DAYS}. Default: %(default)s",
     )
     sync_parser.add_argument(
         "--request-timeout",
@@ -133,6 +140,13 @@ def clean_text(value: str | None) -> str | None:
         return None
     cleaned = re.sub(r"\s+", " ", html.unescape(value)).strip()
     return cleaned or None
+
+
+def validate_accuweather_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.netloc != ALLOWED_HOST:
+        raise SyncError(f"Unexpected URL outside allowed host: {url}")
+    return url
 
 
 def infer_forecast_dates(md_values: list[str], reference_date: date) -> list[date]:
@@ -171,9 +185,10 @@ def parse_daily_forecasts(page_html: str, location: Location, reference_date: da
         if md_text is None:
             continue
         md_values.append(md_text)
+        detail_url = validate_accuweather_url(urljoin(BASE_URL, href_match.group(1)))
         extracted.append(
             {
-                "detail_url": urljoin(BASE_URL, href_match.group(1)),
+                "detail_url": detail_url,
                 "high_c": parse_temperature(high_match.group(1)) if high_match else None,
                 "low_c": parse_temperature(low_match.group(1)) if low_match else None,
                 "precip_probability": int(precip_match.group(1)) if precip_match else None,
@@ -248,10 +263,15 @@ class AccuWeatherClient:
         )
 
     def fetch(self, url: str) -> str:
+        validate_accuweather_url(url)
         for attempt in range(1, self.retries + 1):
             logging.debug("Fetching %s attempt=%s", url, attempt)
             response = self.session.get(url, timeout=self.timeout)
+            validate_accuweather_url(response.url)
             if response.ok:
+                content_type = response.headers.get("Content-Type", "")
+                if "text/html" not in content_type:
+                    raise SyncError(f"Unexpected content type for {url}: {content_type or 'missing'}")
                 return response.text
             if response.status_code not in {403, 429, 500, 502, 503, 504} or attempt == self.retries:
                 response.raise_for_status()
@@ -271,7 +291,9 @@ class AccuWeatherClient:
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
+        PRAGMA foreign_keys = ON;
         PRAGMA journal_mode = WAL;
+        PRAGMA busy_timeout = 5000;
 
         CREATE TABLE IF NOT EXISTS locations (
             location_key TEXT PRIMARY KEY,
@@ -429,6 +451,10 @@ def handle_sync(args: argparse.Namespace) -> int:
         raise SystemExit("--history-backfill-days must be >= 1")
     if args.forecast_days < 1:
         raise SystemExit("--forecast-days must be >= 1")
+    if args.history_backfill_days > MAX_HISTORY_BACKFILL_DAYS:
+        raise SystemExit(f"--history-backfill-days must be <= {MAX_HISTORY_BACKFILL_DAYS}")
+    if args.forecast_days > MAX_FORECAST_DAYS:
+        raise SystemExit(f"--forecast-days must be <= {MAX_FORECAST_DAYS}")
 
     timezone = ZoneInfo(args.timezone)
     local_today = datetime.now(timezone).date()
@@ -452,6 +478,11 @@ def handle_sync(args: argparse.Namespace) -> int:
     for location in LOCATIONS:
         daily_html = client.fetch(location.daily_url)
         parsed_forecasts = parse_daily_forecasts(daily_html, location, local_today)
+        if len(parsed_forecasts) < args.forecast_days:
+            raise SyncError(
+                f"Forecast parser returned too few rows for {location.city}: "
+                f"expected at least {args.forecast_days}, got {len(parsed_forecasts)}"
+            )
         kept_forecasts = filter_dates(parsed_forecasts, forecast_dates)
         logging.info("%s forecast rows parsed=%s kept=%s", location.city, len(parsed_forecasts), len(kept_forecasts))
         all_forecasts.extend(kept_forecasts)
@@ -459,7 +490,13 @@ def handle_sync(args: argparse.Namespace) -> int:
         for target_month in collect_months(history_start, history_end):
             monthly_html = client.fetch(location.monthly_url(target_month))
             parsed_history = parse_monthly_history(monthly_html, location, target_month)
+            expected_in_month = sum(1 for item in history_dates if month_start(item) == target_month)
             kept_history = filter_dates(parsed_history, history_dates)
+            if len(kept_history) < expected_in_month:
+                raise SyncError(
+                    f"History parser returned too few rows for {location.city} month={target_month:%Y-%m}: "
+                    f"expected {expected_in_month}, got {len(kept_history)}"
+                )
             logging.info(
                 "%s history month=%s parsed=%s kept=%s",
                 location.city,

@@ -1,7 +1,7 @@
 import unittest
 from datetime import date
 
-from weather_sync import LOCATIONS, parse_daily_forecasts, parse_monthly_history
+from weather_sync import LOCATIONS, SyncError, parse_daily_forecasts, parse_monthly_history, validate_accuweather_url
 
 
 FORECAST_HTML = """
@@ -75,6 +75,10 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(records[0].weather_date.isoformat(), "2026-03-30")
         self.assertEqual(records[0].actual_high_c, 31)
         self.assertEqual(records[0].actual_low_c, 22)
+
+    def test_validate_accuweather_url_rejects_untrusted_host(self) -> None:
+        with self.assertRaises(SyncError):
+            validate_accuweather_url("https://evil.example.com/path")
 
 
 if __name__ == "__main__":
