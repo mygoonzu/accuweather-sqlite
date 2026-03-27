@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import html
 import logging
 import re
 import sqlite3
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -83,6 +85,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--db", default="weather.db", help="SQLite database path. Default: %(default)s")
     parser.add_argument(
+        "--lock-file",
+        default=".weather_sync.lock",
+        help="Path to the lock file that prevents concurrent sync runs. Default: %(default)s",
+    )
+    parser.add_argument(
         "--timezone",
         default=DEFAULT_TIMEZONE,
         help="IANA timezone used to determine 'today'. Default: %(default)s",
@@ -112,6 +119,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=30,
         help="HTTP timeout in seconds. Default: %(default)s",
+    )
+    sync_parser.add_argument(
+        "--min-request-interval",
+        type=float,
+        default=0.5,
+        help="Minimum delay in seconds between outbound HTTP requests. Default: %(default)s",
     )
     sync_parser.add_argument("--dry-run", action="store_true", help="Fetch and parse, but do not write SQLite")
     sync_parser.set_defaults(handler=handle_sync)
@@ -147,6 +160,27 @@ def validate_accuweather_url(url: str) -> str:
     if parsed.scheme != "https" or parsed.netloc != ALLOWED_HOST:
         raise SyncError(f"Unexpected URL outside allowed host: {url}")
     return url
+
+
+@contextmanager
+def acquire_lock(lock_path: Path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("w")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.close()
+        raise SystemExit(f"Another sync process is already running. Lock file: {lock_path}") from exc
+
+    handle.write(f"{Path('/proc/self').resolve().name}\n")
+    handle.flush()
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 def infer_forecast_dates(md_values: list[str], reference_date: date) -> list[date]:
@@ -246,10 +280,18 @@ def parse_monthly_history(page_html: str, location: Location, target_month: date
 
 
 class AccuWeatherClient:
-    def __init__(self, timeout: int, retries: int = 3, backoff_seconds: float = 5.0) -> None:
+    def __init__(
+        self,
+        timeout: int,
+        retries: int = 3,
+        backoff_seconds: float = 5.0,
+        min_request_interval: float = 0.5,
+    ) -> None:
         self.timeout = timeout
         self.retries = retries
         self.backoff_seconds = backoff_seconds
+        self.min_request_interval = min_request_interval
+        self._last_request_monotonic = 0.0
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -265,8 +307,10 @@ class AccuWeatherClient:
     def fetch(self, url: str) -> str:
         validate_accuweather_url(url)
         for attempt in range(1, self.retries + 1):
+            self._respect_min_interval()
             logging.debug("Fetching %s attempt=%s", url, attempt)
             response = self.session.get(url, timeout=self.timeout)
+            self._last_request_monotonic = time.monotonic()
             validate_accuweather_url(response.url)
             if response.ok:
                 content_type = response.headers.get("Content-Type", "")
@@ -286,6 +330,12 @@ class AccuWeatherClient:
             )
             time.sleep(sleep_seconds)
         raise RuntimeError(f"Unreachable fetch retry loop for {url}")
+
+    def _respect_min_interval(self) -> None:
+        elapsed = time.monotonic() - self._last_request_monotonic
+        remaining = self.min_request_interval - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -329,6 +379,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (location_key, weather_date),
             FOREIGN KEY (location_key) REFERENCES locations(location_key)
         );
+
+        CREATE INDEX IF NOT EXISTS idx_forecast_daily_date ON forecast_daily (weather_date);
+        CREATE INDEX IF NOT EXISTS idx_history_daily_date ON history_daily (weather_date);
         """
     )
 
@@ -455,6 +508,8 @@ def handle_sync(args: argparse.Namespace) -> int:
         raise SystemExit(f"--history-backfill-days must be <= {MAX_HISTORY_BACKFILL_DAYS}")
     if args.forecast_days > MAX_FORECAST_DAYS:
         raise SystemExit(f"--forecast-days must be <= {MAX_FORECAST_DAYS}")
+    if args.min_request_interval < 0:
+        raise SystemExit("--min-request-interval must be >= 0")
 
     timezone = ZoneInfo(args.timezone)
     local_today = datetime.now(timezone).date()
@@ -470,60 +525,62 @@ def handle_sync(args: argparse.Namespace) -> int:
         for offset in range((forecast_end - local_today).days + 1)
     }
     scraped_at = datetime.now(timezone).isoformat()
-    client = AccuWeatherClient(timeout=args.request_timeout)
+    client = AccuWeatherClient(timeout=args.request_timeout, min_request_interval=args.min_request_interval)
+    lock_path = Path(args.lock_file)
 
-    all_forecasts: list[ForecastRecord] = []
-    all_history: list[HistoryRecord] = []
+    with acquire_lock(lock_path):
+        all_forecasts: list[ForecastRecord] = []
+        all_history: list[HistoryRecord] = []
 
-    for location in LOCATIONS:
-        daily_html = client.fetch(location.daily_url)
-        parsed_forecasts = parse_daily_forecasts(daily_html, location, local_today)
-        if len(parsed_forecasts) < args.forecast_days:
-            raise SyncError(
-                f"Forecast parser returned too few rows for {location.city}: "
-                f"expected at least {args.forecast_days}, got {len(parsed_forecasts)}"
-            )
-        kept_forecasts = filter_dates(parsed_forecasts, forecast_dates)
-        logging.info("%s forecast rows parsed=%s kept=%s", location.city, len(parsed_forecasts), len(kept_forecasts))
-        all_forecasts.extend(kept_forecasts)
-
-        for target_month in collect_months(history_start, history_end):
-            monthly_html = client.fetch(location.monthly_url(target_month))
-            parsed_history = parse_monthly_history(monthly_html, location, target_month)
-            expected_in_month = sum(1 for item in history_dates if month_start(item) == target_month)
-            kept_history = filter_dates(parsed_history, history_dates)
-            if len(kept_history) < expected_in_month:
+        for location in LOCATIONS:
+            daily_html = client.fetch(location.daily_url)
+            parsed_forecasts = parse_daily_forecasts(daily_html, location, local_today)
+            if len(parsed_forecasts) < args.forecast_days:
                 raise SyncError(
-                    f"History parser returned too few rows for {location.city} month={target_month:%Y-%m}: "
-                    f"expected {expected_in_month}, got {len(kept_history)}"
+                    f"Forecast parser returned too few rows for {location.city}: "
+                    f"expected at least {args.forecast_days}, got {len(parsed_forecasts)}"
                 )
-            logging.info(
-                "%s history month=%s parsed=%s kept=%s",
-                location.city,
-                target_month.strftime("%Y-%m"),
-                len(parsed_history),
-                len(kept_history),
-            )
-            all_history.extend(kept_history)
+            kept_forecasts = filter_dates(parsed_forecasts, forecast_dates)
+            logging.info("%s forecast rows parsed=%s kept=%s", location.city, len(parsed_forecasts), len(kept_forecasts))
+            all_forecasts.extend(kept_forecasts)
 
-    if args.dry_run:
-        print(f"Dry run only. Forecast rows: {len(all_forecasts)}. History rows: {len(all_history)}.")
+            for target_month in collect_months(history_start, history_end):
+                monthly_html = client.fetch(location.monthly_url(target_month))
+                parsed_history = parse_monthly_history(monthly_html, location, target_month)
+                expected_in_month = sum(1 for item in history_dates if month_start(item) == target_month)
+                kept_history = filter_dates(parsed_history, history_dates)
+                if len(kept_history) < expected_in_month:
+                    raise SyncError(
+                        f"History parser returned too few rows for {location.city} month={target_month:%Y-%m}: "
+                        f"expected {expected_in_month}, got {len(kept_history)}"
+                    )
+                logging.info(
+                    "%s history month=%s parsed=%s kept=%s",
+                    location.city,
+                    target_month.strftime("%Y-%m"),
+                    len(parsed_history),
+                    len(kept_history),
+                )
+                all_history.extend(kept_history)
+
+        if args.dry_run:
+            print(f"Dry run only. Forecast rows: {len(all_forecasts)}. History rows: {len(all_history)}.")
+            return 0
+
+        db_path = Path(args.db)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(db_path) as conn:
+            ensure_schema(conn)
+            upsert_locations(conn, LOCATIONS)
+            forecast_count = upsert_forecasts(conn, scraped_at, all_forecasts)
+            history_count = upsert_history(conn, scraped_at, all_history)
+            conn.commit()
+
+        print(
+            f"Synced {forecast_count} forecast rows and {history_count} history rows into {db_path.resolve()} "
+            f"for run date {local_today.isoformat()} ({args.timezone})."
+        )
         return 0
-
-    db_path = Path(args.db)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(db_path) as conn:
-        ensure_schema(conn)
-        upsert_locations(conn, LOCATIONS)
-        forecast_count = upsert_forecasts(conn, scraped_at, all_forecasts)
-        history_count = upsert_history(conn, scraped_at, all_history)
-        conn.commit()
-
-    print(
-        f"Synced {forecast_count} forecast rows and {history_count} history rows into {db_path.resolve()} "
-        f"for run date {local_today.isoformat()} ({args.timezone})."
-    )
-    return 0
 
 
 def main() -> int:
